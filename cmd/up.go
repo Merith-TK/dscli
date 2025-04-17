@@ -264,7 +264,15 @@ func uploadSingleFile(session *discordgo.Session, channel *discordgo.Channel,
 func uploadChunkedFile(session *discordgo.Session, channel *discordgo.Channel,
 	file *os.File, filename string, size, maxChunkSize int64, debug bool, resume bool, startBlock int) error {
 
-	chunkSize := maxChunkSize - 50
+	log.Println("Max chunk size:", maxChunkSize)
+	// Hardcapped 8MB chunk size (8,388,608 bytes)
+	const hardCapChunkSize = 8 * 1024 * 1024
+	chunkSize := hardCapChunkSize
+
+	if debug {
+		log.Printf("Using chunk size: %d bytes (hard capped at 8MB)", chunkSize)
+	}
+
 	if chunkSize <= 0 {
 		return errors.New("calculated chunk size is too small")
 	}
@@ -292,6 +300,10 @@ func uploadChunkedFile(session *discordgo.Session, channel *discordgo.Channel,
 			break
 		}
 
+		// Make a copy of the actual data we read
+		chunkData := make([]byte, n)
+		copy(chunkData, buf[:n])
+
 		if err := verifyChunkSize(int(chunkSize), n); err != nil {
 			return fmt.Errorf("chunk %d validation failed: %v", blockNumber, err)
 		}
@@ -303,10 +315,17 @@ func uploadChunkedFile(session *discordgo.Session, channel *discordgo.Channel,
 			log.Printf("Chunk %d: %d/%d bytes", blockNumber, offset, size)
 		}
 
-		msg := createUploadMessage(strconv.Itoa(blockNumber), bytes.NewReader(buf[:n]))
+		msg := createUploadMessage(strconv.Itoa(blockNumber), bytes.NewReader(chunkData))
+
+		// Send chunk with retries
 		message, err := sendMessageWithRetry(session, channel.ID, msg, 10)
 		if err != nil {
 			return err
+		}
+
+		// Verify the attachment was uploaded correctly
+		if len(message.Attachments) == 0 || message.Attachments[0].Size == 0 {
+			return fmt.Errorf("chunk %d uploaded as zero bytes", blockNumber)
 		}
 
 		if first {
