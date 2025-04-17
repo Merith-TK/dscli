@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/darenliang/dscli/common"
@@ -40,6 +42,50 @@ func init() {
 	upCmd.Flags().BoolVarP(&upResume, "resume", "r", false, "resume upload")
 
 	rootCmd.AddCommand(upCmd)
+}
+
+// sendMessageWithRetry handles the actual message sending with retry logic
+func sendMessageWithRetry(session *discordgo.Session, channelID string, msg *discordgo.MessageSend, maxTries int) (*discordgo.Message, error) {
+	var message *discordgo.Message
+	var err error
+
+	for i := 0; i < maxTries; i++ {
+		message, err = session.ChannelMessageSendComplex(channelID, msg)
+		if err == nil {
+			return message, nil
+		}
+
+		if i < maxTries-1 {
+			waitTime := time.Second * time.Duration(i+1)
+			log.Printf("Upload attempt %d failed, retrying in %v: %v", i+1, waitTime, err)
+			time.Sleep(waitTime)
+		}
+	}
+
+	return nil, fmt.Errorf("failed after %d attempts: %v", maxTries, err)
+}
+
+// createUploadMessage creates a message with the file attachment
+func createUploadMessage(name string, data io.Reader) *discordgo.MessageSend {
+	return &discordgo.MessageSend{
+		Files: []*discordgo.File{
+			{
+				Name:   name,
+				Reader: data,
+			},
+		},
+	}
+}
+
+// verifyChunkSize validates the chunk size before upload
+func verifyChunkSize(chunkSize, actualSize int) error {
+	if actualSize <= 0 {
+		return errors.New("chunk size cannot be zero or negative")
+	}
+	if actualSize > chunkSize {
+		return fmt.Errorf("chunk size %d exceeds maximum %d", actualSize, chunkSize)
+	}
+	return nil
 }
 
 // up command handler
@@ -197,27 +243,10 @@ func uploadSingleFile(session *discordgo.Session, channel *discordgo.Channel,
 		bar = progressbar.DefaultBytes(size, "Uploading "+filename)
 	}
 
-	msg := &discordgo.MessageSend{
-		Files: []*discordgo.File{
-			{
-				Name:   filename,
-				Reader: bytes.NewReader(data),
-			},
-		},
-	}
-
-	// Send file with retries
-	var message *discordgo.Message
-	maxUploadTries := 10
-	for i := 0; i < maxUploadTries; i++ {
-		message, err = session.ChannelMessageSendComplex(channel.ID, msg)
-		if err != nil {
-			if i == maxUploadTries-1 {
-				return fmt.Errorf("failed to upload file after %d attempts: %v", maxUploadTries, err)
-			}
-			continue
-		}
-		break
+	msg := createUploadMessage(filename, bytes.NewReader(data))
+	message, err := sendMessageWithRetry(session, channel.ID, msg, 10)
+	if err != nil {
+		return err
 	}
 
 	if !resume {
@@ -235,77 +264,56 @@ func uploadSingleFile(session *discordgo.Session, channel *discordgo.Channel,
 func uploadChunkedFile(session *discordgo.Session, channel *discordgo.Channel,
 	file *os.File, filename string, size, maxChunkSize int64, debug bool, resume bool, startBlock int) error {
 
-	// Calculate safe chunk size (50 bytes less than max)
 	chunkSize := maxChunkSize - 50
 	if chunkSize <= 0 {
 		return errors.New("calculated chunk size is too small")
 	}
 
-	buf := make([]byte, chunkSize)
-	blockNumber := startBlock
-
 	var bar *progressbar.ProgressBar
 	if !debug {
 		bar = progressbar.DefaultBytes(size, "Uploading "+filename)
-		_ = bar.Add(blockNumber * int(chunkSize))
+		_ = bar.Add(startBlock * int(chunkSize))
 	}
 
 	first := !resume
+	blockNumber := startBlock
 
 	for {
 		blockNumber++
 
-		// Read chunk
-		n, err := file.Read(buf)
-		if err != nil && err != io.EOF {
+		buf := make([]byte, chunkSize)
+		n, err := io.ReadFull(file, buf)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			return fmt.Errorf("failed to read chunk %d: %v", blockNumber, err)
 		}
 
-		// Skip empty chunks
 		if n == 0 {
 			break
 		}
 
-		// Create message with chunk
-		msg := &discordgo.MessageSend{
-			Files: []*discordgo.File{
-				{
-					Name:   strconv.Itoa(blockNumber),
-					Reader: bytes.NewReader(buf[:n]),
-				},
-			},
+		if err := verifyChunkSize(int(chunkSize), n); err != nil {
+			return fmt.Errorf("chunk %d validation failed: %v", blockNumber, err)
 		}
 
-		// Send chunk with retries
-		var message *discordgo.Message
-		maxUploadTries := 10
-		for i := 0; i < maxUploadTries; i++ {
-			message, err = session.ChannelMessageSendComplex(channel.ID, msg)
-			if err != nil {
-				if i == maxUploadTries-1 {
-					return fmt.Errorf("failed to upload chunk %d: %v", blockNumber, err)
-				}
-				continue
-			}
-			break
-		}
-
-		// Update progress
 		if !debug && bar != nil {
 			bar.Add(n)
 		} else if debug {
 			offset, _ := file.Seek(0, io.SeekCurrent)
-			fmt.Printf("%d %d\n", size, offset)
+			log.Printf("Chunk %d: %d/%d bytes", blockNumber, offset, size)
 		}
 
-		// Pin first message if new upload
+		msg := createUploadMessage(strconv.Itoa(blockNumber), bytes.NewReader(buf[:n]))
+		message, err := sendMessageWithRetry(session, channel.ID, msg, 10)
+		if err != nil {
+			return err
+		}
+
 		if first {
 			_ = session.ChannelMessagePin(channel.ID, message.ID)
 			first = false
 		}
 
-		// Check if we've reached the end
-		if n < len(buf) || err == io.EOF {
+		if n < int(chunkSize) {
 			break
 		}
 	}
