@@ -4,14 +4,15 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/bwmarrin/discordgo"
-	"github.com/darenliang/dscli/common"
-	"github.com/schollz/progressbar/v3"
-	"github.com/spf13/cobra"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"github.com/bwmarrin/discordgo"
+	"github.com/darenliang/dscli/common"
+	"github.com/schollz/progressbar/v3"
+	"github.com/spf13/cobra"
 )
 
 var (
@@ -56,11 +57,9 @@ func up(cmd *cobra.Command, args []string) error {
 
 	// check if max Discord channel limit is reached
 	if !upResume && len(fileMap) >= common.MaxDiscordChannels {
-		return errors.New(
-			fmt.Sprintf(
-				"max Discord channel limit of %d is reached",
-				common.MaxDiscordChannels,
-			),
+		return fmt.Errorf(
+			"max Discord channel limit of %d is reached",
+			common.MaxDiscordChannels,
 		)
 	}
 
@@ -84,9 +83,9 @@ func up(cmd *cobra.Command, args []string) error {
 
 	// remote filename already exists
 	if _, ok := fileMap[remote]; ok && !upResume {
-		return errors.New(remote + " already exists on Discord")
+		return fmt.Errorf("%s already exists on Discord", remote)
 	} else if !ok && upResume {
-		return errors.New(remote + " does not exist on Discord")
+		return fmt.Errorf("%s does not exist on Discord", remote)
 	}
 
 	// get size of local file
@@ -122,12 +121,12 @@ func up(cmd *cobra.Command, args []string) error {
 			return errors.New("cannot infer block size")
 		}
 
-		if msgs[0].Attachments[0].Size > maxDiscordFileSize {
-			return errors.New(fmt.Sprintf(
+		if msgs[0].Attachments[0].Size > int(maxDiscordFileSize) {
+			return fmt.Errorf(
 				"inferred block size %d is larger than the largest permitted block size %d",
 				msgs[0].Attachments[0].Size,
 				maxDiscordFileSize,
-			))
+			)
 		}
 
 		maxDiscordFileSize = msgs[0].Attachments[0].Size
@@ -141,7 +140,7 @@ func up(cmd *cobra.Command, args []string) error {
 			if len(msg.Attachments) == 0 {
 				continue
 			}
-			if msg.Attachments[0].Size != maxDiscordFileSize {
+			if msg.Attachments[0].Size != int(maxDiscordFileSize) {
 				return errors.New("complete upload inferred from incomplete last block")
 			}
 			blockNumber, err = strconv.Atoi(msg.Attachments[0].Filename)
@@ -151,7 +150,7 @@ func up(cmd *cobra.Command, args []string) error {
 			break
 		}
 
-		if int64(blockNumber)*int64(maxDiscordFileSize) == size {
+		if int64(blockNumber*maxDiscordFileSize) == size {
 			return errors.New("upload is already complete")
 		}
 
@@ -165,7 +164,7 @@ func up(cmd *cobra.Command, args []string) error {
 		// create channel for file
 		channel, err = session.GuildChannelCreate(guild.ID, encodedRemote, discordgo.ChannelTypeGuildText)
 		if err != nil {
-			return errors.New("cannot create remote file: " + err.Error())
+			return fmt.Errorf("cannot create remote file: %v", err)
 		}
 
 		// set channel topic to filesize
@@ -176,93 +175,137 @@ func up(cmd *cobra.Command, args []string) error {
 		_, _ = session.ChannelEdit(channel.ID, channelSettings)
 	}
 
-	// seek to block number
-	_, err = localFile.Seek(int64(blockNumber)*int64(maxDiscordFileSize), io.SeekStart)
-	if err != nil {
-		return err
+	// Check if file needs chunking
+	if size <= int64(maxDiscordFileSize) {
+		return uploadSingleFile(session, channel, localFile, localBase, size, upDebug, upResume)
 	}
+	return uploadChunkedFile(session, channel, localFile, localBase, size, int64(maxDiscordFileSize), upDebug, upResume, blockNumber)
+}
 
-	// setup buffer with max Discord file size
-	buf := make([]byte, maxDiscordFileSize)
+// uploadSingleFile handles files that fit within Discord's size limit
+func uploadSingleFile(session *discordgo.Session, channel *discordgo.Channel,
+	file *os.File, filename string, size int64, debug bool, resume bool) error {
+
+	// Read entire file
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %v", err)
+	}
 
 	var bar *progressbar.ProgressBar
-
-	if !upDebug {
-		// init progress bar
-		bar = progressbar.DefaultBytes(
-			size,
-			"Uploading "+localBase,
-		)
-		err := bar.Add(blockNumber * maxDiscordFileSize)
-		if err != nil {
-			return err
-		}
+	if !debug {
+		bar = progressbar.DefaultBytes(size, "Uploading "+filename)
 	}
 
-	first := true
+	msg := &discordgo.MessageSend{
+		Files: []*discordgo.File{
+			{
+				Name:   filename,
+				Reader: bytes.NewReader(data),
+			},
+		},
+	}
+
+	// Send file with retries
+	var message *discordgo.Message
+	maxUploadTries := 10
+	for i := 0; i < maxUploadTries; i++ {
+		message, err = session.ChannelMessageSendComplex(channel.ID, msg)
+		if err != nil {
+			if i == maxUploadTries-1 {
+				return fmt.Errorf("failed to upload file after %d attempts: %v", maxUploadTries, err)
+			}
+			continue
+		}
+		break
+	}
+
+	if !resume {
+		_ = session.ChannelMessagePin(channel.ID, message.ID)
+	}
+
+	if !debug && bar != nil {
+		bar.Add64(size)
+	}
+
+	return nil
+}
+
+// uploadChunkedFile handles files that exceed Discord's size limit
+func uploadChunkedFile(session *discordgo.Session, channel *discordgo.Channel,
+	file *os.File, filename string, size, maxChunkSize int64, debug bool, resume bool, startBlock int) error {
+
+	// Calculate safe chunk size (50 bytes less than max)
+	chunkSize := maxChunkSize - 50
+	if chunkSize <= 0 {
+		return errors.New("calculated chunk size is too small")
+	}
+
+	buf := make([]byte, chunkSize)
+	blockNumber := startBlock
+
+	var bar *progressbar.ProgressBar
+	if !debug {
+		bar = progressbar.DefaultBytes(size, "Uploading "+filename)
+		_ = bar.Add(blockNumber * int(chunkSize))
+	}
+
+	first := !resume
 
 	for {
-		blockNumber += 1
+		blockNumber++
 
-		// read chunk
-		length, err := localFile.Read(buf)
-		if err != nil {
-			return err
+		// Read chunk
+		n, err := file.Read(buf)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("failed to read chunk %d: %v", blockNumber, err)
 		}
 
-		var reader io.Reader
-
-		if !upDebug {
-			reader = io.TeeReader(bytes.NewReader(buf[:length]), bar)
-		} else {
-			reader = bytes.NewReader(buf[:length])
+		// Skip empty chunks
+		if n == 0 {
+			break
 		}
 
+		// Create message with chunk
 		msg := &discordgo.MessageSend{
 			Files: []*discordgo.File{
 				{
 					Name:   strconv.Itoa(blockNumber),
-					Reader: reader,
+					Reader: bytes.NewReader(buf[:n]),
 				},
 			},
 		}
 
-		// send chunk
-		// retry 5 times because internet can be flaky and Discord sometimes
-		// likes to drop connections
+		// Send chunk with retries
 		var message *discordgo.Message
 		maxUploadTries := 10
 		for i := 0; i < maxUploadTries; i++ {
 			message, err = session.ChannelMessageSendComplex(channel.ID, msg)
 			if err != nil {
 				if i == maxUploadTries-1 {
-					return err
-				} else {
-					continue
+					return fmt.Errorf("failed to upload chunk %d: %v", blockNumber, err)
 				}
+				continue
 			}
 			break
 		}
 
-		if upDebug {
-			offset, err := localFile.Seek(0, io.SeekCurrent)
-			if err != nil {
-				return err
-			}
-			fmt.Printf("%d %d \n", size, offset)
+		// Update progress
+		if !debug && bar != nil {
+			bar.Add(n)
+		} else if debug {
+			offset, _ := file.Seek(0, io.SeekCurrent)
+			fmt.Printf("%d %d\n", size, offset)
 		}
 
-		if first && !upResume {
-			// if pin fails, ignore
-			// the reason why we pin is because Discord exposes the timestamp
-			// of the last pin in channel which is useful for obtaining the
-			// file's creation date
-			_ = session.ChannelMessagePin(message.ChannelID, message.ID)
+		// Pin first message if new upload
+		if first {
+			_ = session.ChannelMessagePin(channel.ID, message.ID)
 			first = false
 		}
 
-		// exit loop if EOF
-		if length < maxDiscordFileSize {
+		// Check if we've reached the end
+		if n < len(buf) || err == io.EOF {
 			break
 		}
 	}

@@ -2,9 +2,10 @@ package common
 
 import (
 	"errors"
+	"strconv"
+
 	"github.com/bwmarrin/discordgo"
 	"github.com/spf13/viper"
-	"strconv"
 )
 
 // GetDiscordSession gets the Discord session, guild and channels
@@ -66,7 +67,7 @@ func GetMaxFileSizeUpload(session *discordgo.Session, guild *discordgo.Guild) (i
 		case 2:
 			maxSizeUser = MaxDiscordFileSizeNitro
 		default:
-			return 0, errors.New("invalid user premium type: " + strconv.Itoa(user.PremiumType))
+			return 0, errors.New("invalid user premium type: " + strconv.Itoa(int(user.PremiumType)))
 		}
 	} else {
 		// return default if user is a bot
