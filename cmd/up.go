@@ -243,7 +243,7 @@ func uploadSingleFile(session *discordgo.Session, channel *discordgo.Channel,
 		bar = progressbar.DefaultBytes(size, "Uploading "+filename)
 	}
 
-	msg := createUploadMessage(filename, bytes.NewReader(data))
+	msg := createUploadMessage("1", bytes.NewReader(data))
 	message, err := sendMessageWithRetry(session, channel.ID, msg, 10)
 	if err != nil {
 		return err
@@ -281,6 +281,7 @@ func uploadChunkedFile(session *discordgo.Session, channel *discordgo.Channel,
 	for {
 		blockNumber++
 
+		// Read chunk into a new buffer each time
 		buf := make([]byte, chunkSize)
 		n, err := io.ReadFull(file, buf)
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
